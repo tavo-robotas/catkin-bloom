@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use clap::*;
+use log::*;
 use quick_xml::{events::Event, Reader};
 use rayon::{iter::*, *};
 use serde::{Deserialize, Serialize};
@@ -8,7 +9,7 @@ use std::env::current_dir;
 use std::ffi::OsStr;
 use std::fmt::Write as FmtWrite;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,7 +17,13 @@ use tempfile::tempdir;
 use walkdir::WalkDir;
 
 fn main() -> Result<()> {
+    env_logger::init();
+
     let args = parse_args();
+
+    let args = (&args).into();
+
+    debug!("{args:?}");
 
     let RuntimeArgs {
         os_name,
@@ -27,7 +34,10 @@ fn main() -> Result<()> {
         only_check,
         src,
         jobs,
-    } = (&args).into();
+        extra_repos,
+        noinstall_deps,
+        rosdep_defs,
+    } = args;
 
     let pool = ThreadPoolBuilder::new().num_threads(jobs).build().unwrap();
 
@@ -35,10 +45,12 @@ fn main() -> Result<()> {
     let mut workspace_pkgs = HashSet::new();
 
     // Step 1 - collect all dependencies in the workspace
+    println!("Collecting packages");
+
     for entry in WalkDir::new(src) {
         if let Ok(entry) = entry {
             if entry.file_type().is_file() && entry.file_name() == OsStr::new("package.xml") {
-                println!("{}", entry.path().display());
+                debug!("Found {}", entry.path().display());
 
                 let mut reader = Reader::from_file(entry.path())?;
                 let mut buf = vec![];
@@ -79,7 +91,7 @@ fn main() -> Result<()> {
         deps.retain(|v| workspace_pkgs.contains(v));
     }
 
-    println!("{pkgs:?}");
+    trace!("{pkgs:?}");
 
     // Step 3 - sort the packages in the dependency fullfilling order
     let mut ordered_pkgs = vec![];
@@ -96,7 +108,7 @@ fn main() -> Result<()> {
         let mut i = 0;
         while i < tmp_pkgs.len() {
             if tmp_pkgs[i].2.is_empty() {
-                println!("REMOVE {}", tmp_pkgs[i].0);
+                trace!("REMOVE {}", tmp_pkgs[i].0);
                 let (name, path, deps) = tmp_pkgs.swap_remove(i);
                 drained_names.insert(name.clone());
                 let pkg = format!("ros-{ros_distro}-{}", name.replace("_", "-"));
@@ -110,7 +122,7 @@ fn main() -> Result<()> {
             break;
         }
 
-        println!("DRAIN {:?}", drained);
+        trace!("DRAIN {:?}", drained);
 
         for (_, _, d) in &mut tmp_pkgs {
             d.retain(|d| !drained_names.contains(d))
@@ -119,21 +131,16 @@ fn main() -> Result<()> {
         ordered_pkgs.push(drained);
     }
 
-    println!("{ordered_pkgs:?}");
+    trace!("{ordered_pkgs:?}");
 
     if !tmp_pkgs.is_empty() {
-        println!("Cycled:");
-        println!("{tmp_pkgs:?}");
+        warn!("Found packages with cycles: {tmp_pkgs:?}");
     }
 
     // Step 4 - generate packages
 
     let package_root = Path::new(repo_path);
     fs::create_dir_all(&package_root)?;
-    let repo_path_name = package_root
-        .file_name()
-        .and_then(|p| p.to_str())
-        .unwrap_or("unknown");
 
     // Generate a rosdep yaml file
 
@@ -143,43 +150,115 @@ fn main() -> Result<()> {
         writeln!(rosdistro, "{p}:\n  {os_name}: [{pkg}]",)?;
     }
 
+    for (k, v) in rosdep_defs {
+        writeln!(rosdistro, "{k}:\n  {os_name}: [{v}]",)?;
+    }
+
     let mut rosdep = File::create(package_root.join("package.yaml"))?;
     rosdep.write_all(rosdistro.as_bytes())?;
 
-    // Generate rosdep list file
-    let mut rosdep = File::create(&format!(
-        "/etc/ros/rosdep/sources.list.d/99-catkin-bloom-{repo_path_name}.list"
-    ))?;
-    writeln!(
-        rosdep,
-        "yaml file://{}/package.yaml",
-        package_root.canonicalize()?.display()
-    )?;
+    for (i, path) in std::iter::once(repo_path)
+        .chain(extra_repos.iter().copied())
+        .enumerate()
+    {
+        let package_root = Path::new(path);
 
-    // Generate a debian list file
-    let mut deb = File::create(&format!(
-        "/etc/apt/sources.list.d/99-catkin-bloom-{repo_path_name}.list"
-    ))?;
-    writeln!(
-        deb,
-        "deb [trusted=yes] file://{} /",
-        package_root.canonicalize()?.display()
-    )?;
+        let repo_path_name = package_root
+            .file_name()
+            .and_then(|p| p.to_str())
+            .unwrap_or("unknown");
 
-    //let _ = OpenOptions::new()
-    //    .create(true)
-    //    .truncate(true)
-    //    .write(true)
-    //    .append(false)
-    //    .open(package_root.join("Packages"))?;
+        // Generate rosdep list file
+        let mut rosdep = File::create(&format!(
+            "/etc/ros/rosdep/sources.list.d/99-catkin-bloom-{i}-{repo_path_name}.list"
+        ))?;
+        writeln!(
+            rosdep,
+            "yaml file://{}/package.yaml",
+            package_root.canonicalize()?.display()
+        )?;
+
+        // Generate a debian list file
+        let mut deb = File::create(&format!(
+            "/etc/apt/sources.list.d/99-catkin-bloom-{i}-{repo_path_name}.list"
+        ))?;
+        writeln!(
+            deb,
+            "deb [trusted=yes] file://{} /",
+            package_root.canonicalize()?.display()
+        )?;
+    }
 
     // Update rosdep
 
+    println!("Run rosdep update");
+
     Command::new("rosdep").arg("update").output()?;
 
+    // Install dependencies if enabled
+
+    if !noinstall_deps {
+        println!("Installing dependencies");
+
+        info!("Run rosdep check");
+
+        // First install all apt dependencies in an optimized way
+        let o = Command::new("rosdep")
+            .args(["check", "--from-paths", src, "--ignore-src"])
+            .output()?;
+
+        info!("Run apt update");
+
+        Command::new("apt").arg("update").output()?;
+
+        info!("Run apt install");
+
+        let o = Command::new("apt")
+            .env("DEBIAN_FRONTEND", "noninteractive")
+            .args(["install", "-y"])
+            .args(
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .filter_map(|l| l.strip_prefix("apt\t"))
+                    .map(str::trim),
+            )
+            .output()?;
+
+        if o.status.code().unwrap_or_default() != 0 {
+            return Err(anyhow!(
+                "Failed to do apt install '{}' | '{}'",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr),
+            ));
+        }
+
+        // Then install all other dependencies
+        info!("Run rosdep install");
+
+        let o = Command::new("rosdep")
+            .env("DEBIAN_FRONTEND", "noninteractive")
+            .args(["install", "--from-paths", src, "--ignore-src", "-y"])
+            .output()?;
+
+        if o.status.code().unwrap_or_default() != 0 {
+            return Err(anyhow!(
+                "Failed to do rosdep install '{}' | '{}'",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            ));
+        }
+    }
+
     // Build packages one by one
+    let pkg_count = ordered_pkgs.iter().flatten().count();
+    println!("Building packages ({pkg_count})");
+
+    let pb = indicatif::ProgressBar::new(pkg_count as u64);
+    pb.enable_steady_tick(100);
 
     for (i, pkgs) in ordered_pkgs.iter().enumerate() {
+        pb.println(&format!("Layer {i}"));
+
         pool.install(|| {
             let success = AtomicBool::new(true);
 
@@ -192,11 +271,9 @@ fn main() -> Result<()> {
                             .map(|v| v.contains(&p.as_str()))
                             .unwrap_or(true)
                     {
-                        println!("{i} {package_root:?}");
-
                         match bloom(&p, package_root, &d, os_name, os_version, ros_distro) {
                             Err(e) => {
-                                println!("ERROR {p}: {e}");
+                                error!("{p}: {e}");
                                 success.store(false, Ordering::Relaxed);
                                 vec![]
                             }
@@ -206,12 +283,13 @@ fn main() -> Result<()> {
                         vec![]
                     }
                 })
+                .inspect(|_| pb.inc(1))
                 .collect::<Vec<_>>();
 
             if success.load(Ordering::Relaxed) {
                 let o = Command::new("dpkg").args(["-i"]).args(debs).output()?;
 
-                println!(
+                trace!(
                     "stdout:\n{}\n\nstderr:\n{}",
                     String::from_utf8_lossy(&o.stdout),
                     String::from_utf8_lossy(&o.stderr)
@@ -223,6 +301,10 @@ fn main() -> Result<()> {
             }
         })?;
     }
+
+    pb.finish();
+
+    println!("Generating Package manifest");
 
     let mut packages = OpenOptions::new()
         .create(true)
@@ -284,20 +366,46 @@ fn parse_args() -> ArgMatches {
                 .takes_value(true)
                 .required(true),
         )
+        .arg(
+            Arg::new("noinstall-deps")
+                .long("noinstall-deps")
+                .short('n')
+                .takes_value(false),
+        )
+        .arg(
+            Arg::new("rosdep-defs")
+                .long("rosdep-defs")
+                .short('D')
+                .takes_value(true)
+                .multiple_values(true)
+                .use_value_delimiter(true),
+        )
+        .arg(
+            Arg::new("extra-repos")
+                .long("extra-repos")
+                .short('e')
+                .takes_value(true)
+                .multiple_values(true)
+                .use_value_delimiter(true),
+        )
         .arg(Arg::new("jobs").long("jobs").short('j').takes_value(true))
         .arg(Arg::new("src").takes_value(true).default_value("."))
         .get_matches()
 }
 
+#[derive(Debug)]
 struct RuntimeArgs<'a> {
     os_name: &'a str,
     os_version: &'a str,
     ros_distro: &'a str,
     repo_path: &'a str,
     ignored_pkgs: Vec<&'a str>,
+    extra_repos: Vec<&'a str>,
     only_check: Option<Vec<&'a str>>,
+    rosdep_defs: Vec<(&'a str, &'a str)>,
     src: &'a str,
     jobs: usize,
+    noinstall_deps: bool,
 }
 
 impl<'a> From<&'a ArgMatches> for RuntimeArgs<'a> {
@@ -312,12 +420,24 @@ impl<'a> From<&'a ArgMatches> for RuntimeArgs<'a> {
                 .into_iter()
                 .flatten()
                 .collect(),
+            extra_repos: matches
+                .values_of("extra-repos")
+                .into_iter()
+                .flatten()
+                .collect(),
+            rosdep_defs: matches
+                .values_of("rosdep-defs")
+                .into_iter()
+                .flatten()
+                .filter_map(|l| l.split_once("="))
+                .collect(),
             only_check: matches.values_of("only-check").map(Iterator::collect),
             src: matches.value_of("src").unwrap(),
             jobs: matches
                 .value_of("jobs")
                 .and_then(|j| usize::from_str_radix(j, 10).ok())
                 .unwrap_or(1),
+            noinstall_deps: matches.occurrences_of("noinstall_deps") > 0,
         }
     }
 }
@@ -344,15 +464,12 @@ fn bloom(
     ros_distro: &str,
 ) -> Result<Vec<PathBuf>> {
     let build_root = tempdir()?;
-    //println!("{build_root:?}");
 
     let pb = build_root.path().join("build");
     fs::create_dir(&pb)?;
 
     let cwd = current_dir()?;
     let p = cwd.join(path);
-
-    //println!("{p:?}");
 
     // Generate debian build directory
 
@@ -371,7 +488,7 @@ fn bloom(
         .output()?;
 
     if o.status.code().unwrap_or_default() != 0 {
-        println!(
+        error!(
             "stdout:\n{}\n\nstderr:\n{}",
             String::from_utf8_lossy(&o.stdout),
             String::from_utf8_lossy(&o.stderr)
@@ -404,7 +521,7 @@ fn bloom(
         .output()?;
 
     if o.status.code().unwrap_or_default() != 0 {
-        println!(
+        error!(
             "stdout:\n{}\n\nstderr:\n{}",
             String::from_utf8_lossy(&o.stdout),
             String::from_utf8_lossy(&o.stderr)
@@ -427,10 +544,10 @@ fn bloom(
         .filter_map(|s| s.strip_prefix("Filename: "))
         .map(Path::new)
     {
-        println!("{}", fp.display());
+        debug!("{}", fp.display());
         let origin = build_root.path().join(fp);
         let target = package_dir.join(fp);
-        println!("DEB: {}", target.display());
+        debug!("Copied to: {}", target.display());
         fs::copy(&origin, &target)?;
         debs.push(target);
     }

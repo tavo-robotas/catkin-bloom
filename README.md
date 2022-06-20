@@ -6,9 +6,27 @@ catkin-bloom is an utility program meant to help building ROS packages locally, 
 
 catkin-bloom primarily aims to support running under ROS docker images, thus debian packaging is currently supported. In addition, this is a very early version that only supports ROS melodic on Ubuntu bionic. More flexibility is under way.
 
-### How to run
+### Run through Docker
 
-First, install rust toolchain, and install catkin-bloom through it
+You can build the docker image using:
+
+```
+docker build -t catkin-bloom .
+```
+
+Then, run the image with appropriate mounts:
+
+```
+docker run -v "${PWD}/src":/workspace -v "${PWD}/repo":/repo -it --rm catkin-bloom --repo-path /repo -j8 /workspace
+```
+
+`os-name`, `os-version` and `ros-distro` arguments are automatically set based on the docker image environment.
+
+If no arguments are supplied, `repo-path` defaults to `/repo`, `jobs` defaults to 8, and the workspace path defaults to `/workspace`.
+
+### Run locally
+
+First, install rust toolchain, and install catkin-bloom through it:
 
 ```
 cargo install --path .
