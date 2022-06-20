@@ -20,13 +20,19 @@ Or, when this package is on crates.io:
 cargo install catkin-bloom
 ```
 
-Then, run the program on the workspace
+Then, install required dependencies:
 
 ```
-catkin-bloom
+apt install dh-make python-bloom fakeroot
 ```
 
-Lots of things TODO, but the resulting debs will be found under /tmp/bloom directory.
+Then, run the program on the workspace source:
+
+```
+catkin-bloom -r /tmp/bloom src
+```
+
+The resulting debs will be found under /tmp/bloom directory. Repository will be automatically added to `/etc/apt/sources.list.d`, and `/etc/ros/rosdep/sources.list.d`.
 
 In addition, this program will install all of those packages, to cleanup, run the following:
 
@@ -60,4 +66,4 @@ The way catkin-bloom works is by walking the entire workspace, parsing dependenc
 
 ```
 
-Not done yet, but packages A, B, C can be built concurrently, speeding up the process. Same with D, E, and F, G respectively.
+Packages A, B, C can be built concurrently, speeding up the process. Same with D, E, and F, G respectively.
